@@ -186,65 +186,15 @@ int rhizome_delete_file(const rhizome_filehash_t *filehash)
   return rhizome_delete_file_retry(&retry, filehash);
 }
 
-static uint64_t store_get_free_space()
-{
-  const char *fake_space = getenv("SERVALD_FREE_SPACE");
-  uint64_t space = UINT64_MAX;
-  if (fake_space)
-    space = atol(fake_space);
-#if defined(HAVE_SYS_STATVFS_H) || (defined(HAVE_SYS_STAT_H) && defined(HAVE_SYS_VFS_H))
-  else {
-    struct statvfs stats;
-    if (statvfs(rhizome_database.dir_path, &stats)==-1)
-      WARNF_perror("statvfs(%s)", alloca_str_toprint(rhizome_database.dir_path));
-    else
-      space = stats.f_frsize * (uint64_t)stats.f_bavail;
-  }
-#endif
-  if (IF_DEBUG(rhizome)) {
-    // Automated tests depend on this message; do not alter.
-    DEBUGF(rhizome, "RHIZOME SPACE FREE bytes=%"PRIu64" (%sB)", space, alloca_double_scaled_binary(space));
-  }
-  return space;
-}
-
-static uint64_t store_space_limit(uint64_t current_size)
-{
-  uint64_t limit = config.rhizome.database_size;
-  
-  if (config.rhizome.min_free_space!=0){
-    uint64_t free_space = store_get_free_space();
-    if (free_space < config.rhizome.min_free_space){
-      if (current_size + free_space < config.rhizome.min_free_space)
-	limit = 0;
-      else
-	limit = current_size + free_space - config.rhizome.min_free_space;
-    }
-  }
-  return limit;
-}
-
-// TODO readonly version?
-static enum rhizome_payload_status store_make_space(uint64_t bytes, struct rhizome_cleanup_report *report)
-{
-  uint64_t external_bytes=0;
-  uint64_t db_page_size=0;
-  uint64_t db_page_count=0;
-  uint64_t db_free_page_count=0;
-  
-  // No limit?
-  if (config.rhizome.database_size==UINT64_MAX && config.rhizome.min_free_space==0)
-    return RHIZOME_PAYLOAD_STATUS_NEW;
-  
-  sqlite_retry_state retry = SQLITE_RETRY_STATE_DEFAULT;
-  int stepcode = sqlite_exec_uint64_retry(&retry, &db_page_size, "PRAGMA page_size;", END);
+static enum rhizome_payload_status store_space_report(sqlite_retry_state *retry, struct rhizome_space_report *space){
+  int stepcode = sqlite_exec_uint64_retry(retry, &space->db_page_size, "PRAGMA page_size;", END);
   if (sqlite_code_ok(stepcode))
-    stepcode = sqlite_exec_uint64_retry(&retry, &db_page_count, "PRAGMA page_count;", END);
+    stepcode = sqlite_exec_uint64_retry(retry, &space->db_total_pages, "PRAGMA page_count;", END);
   if (sqlite_code_ok(stepcode))
-    stepcode = sqlite_exec_uint64_retry(&retry, &db_free_page_count, "PRAGMA freelist_count;", END);
+    stepcode = sqlite_exec_uint64_retry(retry, &space->db_available_pages, "PRAGMA freelist_count;", END);
   if (sqlite_code_ok(stepcode))
     // TODO index and/or cache result?
-    stepcode = sqlite_exec_uint64_retry(&retry, &external_bytes,
+    stepcode = sqlite_exec_uint64_retry(retry, &space->external_bytes,
 	  "SELECT SUM(length) "
 	  "FROM FILES  "
 	  "WHERE NOT EXISTS( "
@@ -258,26 +208,99 @@ static enum rhizome_payload_status store_make_space(uint64_t bytes, struct rhizo
   if (!sqlite_code_ok(stepcode))
     return RHIZOME_PAYLOAD_STATUS_ERROR;
 
-  uint64_t db_used = external_bytes + db_page_size * (db_page_count - db_free_page_count);
-  const uint64_t limit = store_space_limit(db_used);
+  space->content_bytes = space->external_bytes + space->db_page_size * (space->db_total_pages - space->db_available_pages);
+
+  // Measure filesystem free space
+  space->filesystem_bytes = UINT64_MAX;
+  space->filesystem_free_bytes = UINT64_MAX;
+
+#if defined(HAVE_SYS_STATVFS_H) || (defined(HAVE_SYS_STAT_H) && defined(HAVE_SYS_VFS_H))
+  {
+    struct statvfs stats;
+    if (statvfs(rhizome_database.dir_path, &stats)==-1)
+      WARNF_perror("statvfs(%s)", rhizome_database.dir_path);
+    else{
+      space->filesystem_bytes = stats.f_frsize * (uint64_t)stats.f_blocks;
+      space->filesystem_free_bytes = stats.f_frsize * (uint64_t)stats.f_bavail;
+    }
+  }
+#endif
+  // Fake limit for reproducible testing
+  const char *fake_space = getenv("SERVALD_FREE_SPACE");
+  if (fake_space)
+    space->filesystem_free_bytes = atol(fake_space);
+
+  // Calculate storage limit
+  space->content_limit_bytes = config.rhizome.database_size;
+
+  if (config.rhizome.min_free_space !=0){
+    uint64_t space_limit;
+    if (space->content_bytes + space->filesystem_free_bytes < config.rhizome.min_free_space)
+      space_limit = 0;
+    else
+      space_limit = space->content_bytes + space->filesystem_free_bytes - config.rhizome.min_free_space;
+    if (space_limit < space->content_limit_bytes)
+      space->content_limit_bytes = space_limit;
+  }
 
   // Automated tests depend on this message; do not alter.
-  DEBUGF(rhizome, "RHIZOME SPACE USED bytes=%"PRIu64" (%sB), LIMIT bytes=%"PRIu64" (%sB)",
-      db_used, alloca_double_scaled_binary(db_used),
-      limit, alloca_double_scaled_binary(limit));
-  
-  if (bytes && bytes >= limit){
+  DEBUGF(rhizome, "RHIZOME SPACE USED bytes=%"PRIu64" (%sB), FREE bytes=%"PRIu64" (%sB), LIMIT bytes=%"PRIu64" (%sB)",
+      space->content_bytes, alloca_double_scaled_binary(space->content_bytes),
+      space->filesystem_free_bytes, alloca_double_scaled_binary(space->filesystem_free_bytes),
+      space->content_limit_bytes, alloca_double_scaled_binary(space->content_limit_bytes));
+
+  return RHIZOME_PAYLOAD_STATUS_EMPTY;
+}
+
+enum rhizome_payload_status rhizome_store_space_usage(struct rhizome_space_report *space)
+{
+  sqlite_retry_state retry = SQLITE_RETRY_STATE_DEFAULT;
+  return store_space_report(&retry, space);
+}
+
+
+static enum rhizome_payload_status sqlite_vacuum(sqlite_retry_state *retry, struct rhizome_space_report *space){
+  // vacuum database pages if more than 1/4 of the db is free or we're already over the limit
+  if (space->db_available_pages > (space->db_total_pages>>2)+1 || space->external_bytes + space->db_page_size * space->db_total_pages > space->content_limit_bytes){
+    rhizome_vacuum_db(retry);
+
+    int stepcode = sqlite_exec_uint64_retry(retry, &space->db_total_pages, "PRAGMA page_count;", END);
+    if (sqlite_code_ok(stepcode))
+      stepcode = sqlite_exec_uint64_retry(retry, &space->db_available_pages, "PRAGMA freelist_count;", END);
+
+    if (sqlite_code_busy(stepcode))
+      return RHIZOME_PAYLOAD_STATUS_BUSY;
+    if (!sqlite_code_ok(stepcode))
+      return RHIZOME_PAYLOAD_STATUS_ERROR;
+  }
+  return RHIZOME_PAYLOAD_STATUS_EMPTY;
+}
+
+// TODO readonly version?
+static enum rhizome_payload_status store_make_space(uint64_t bytes, struct rhizome_cleanup_report *report)
+{
+  sqlite_retry_state retry = SQLITE_RETRY_STATE_DEFAULT;
+  struct rhizome_space_report space;
+  int stepcode;
+
+  enum rhizome_payload_status r;
+  if ((r = store_space_report(&retry, &space)) != RHIZOME_PAYLOAD_STATUS_EMPTY)
+    return r;
+
+  if (report)
+    report->space_used = space;
+
+  if (bytes && bytes >= space.content_limit_bytes){
     DEBUGF(rhizome, "Not enough space for %"PRIu64". Used; %"PRIu64" = %"PRIu64" + %"PRIu64" * (%"PRIu64" - %"PRIu64"), Limit; %"PRIu64, 
-	   bytes, db_used, external_bytes, db_page_size, db_page_count, db_free_page_count, limit);
+	   bytes, space.content_bytes, space.external_bytes, space.db_page_size, space.db_total_pages, space.db_available_pages, space.content_limit_bytes);
     return RHIZOME_PAYLOAD_STATUS_TOO_BIG;
   }
-  
-  // vacuum database pages if more than 1/4 of the db is free or we're already over the limit
-  if (db_free_page_count > (db_page_count>>2)+1 || external_bytes + db_page_size * db_page_count > limit)
-    rhizome_vacuum_db(&retry);
-  
+
+  if ((r = sqlite_vacuum(&retry, &space)) != RHIZOME_PAYLOAD_STATUS_EMPTY)
+    return r;
+
   // If there is enough space, do nothing
-  if (db_used + bytes <= limit)
+  if (space.content_bytes + bytes <= space.content_limit_bytes)
     return RHIZOME_PAYLOAD_STATUS_NEW;
   
   // penalise new things by 10 minutes to reduce churn
@@ -290,7 +313,7 @@ static enum rhizome_payload_status store_make_space(uint64_t bytes, struct rhizo
   if (!statement)
     return RHIZOME_PAYLOAD_STATUS_ERROR;
   
-  while (db_used + bytes > limit && (stepcode=sqlite_step_retry(&retry, statement)) == SQLITE_ROW) {
+  while (space.content_bytes + bytes > space.content_limit_bytes && (stepcode=sqlite_step_retry(&retry, statement)) == SQLITE_ROW) {
     const char *id=(const char *) sqlite3_column_text(statement, 0);
     uint64_t length = sqlite3_column_int(statement, 1);
     time_ms_t inserttime = sqlite3_column_int64(statement, 2);
@@ -307,7 +330,7 @@ static enum rhizome_payload_status store_make_space(uint64_t bytes, struct rhizo
     rhizome_filehash_t hash;
     if (str_to_rhizome_filehash_t(&hash, id)!=-1
         && rhizome_delete_external(&hash)==0)
-      external_bytes -= length;
+      space.external_bytes -= length;
 
     int rowcount=0;
     sqlite3_stmt *s = sqlite_prepare_bind(&retry, "DELETE FROM fileblobs WHERE id = ?", STATIC_TEXT, id, END);
@@ -318,14 +341,14 @@ static enum rhizome_payload_status store_make_space(uint64_t bytes, struct rhizo
     if (s && !sqlite_code_ok(stepcode = sqlite_exec_code_retry(&retry, s, &rowcount)))
       break;
 
-    if (!sqlite_code_ok(stepcode = sqlite_exec_uint64_retry(&retry, &db_page_count, "PRAGMA page_count;", END)))
+    if (!sqlite_code_ok(stepcode = sqlite_exec_uint64_retry(&retry, &space.db_total_pages, "PRAGMA page_count;", END)))
       break;
-    if (!sqlite_code_ok(stepcode = sqlite_exec_uint64_retry(&retry, &db_free_page_count, "PRAGMA freelist_count;", END)))
+    if (!sqlite_code_ok(stepcode = sqlite_exec_uint64_retry(&retry, &space.db_available_pages, "PRAGMA freelist_count;", END)))
       break;
 
     if (report)
       report->deleted_expired_files++;
-    db_used = external_bytes + db_page_size * (db_page_count - db_free_page_count);
+    space.content_bytes = space.external_bytes + space.db_page_size * (space.db_total_pages - space.db_available_pages);
   }
   sqlite3_finalize(statement);
 
@@ -334,13 +357,17 @@ static enum rhizome_payload_status store_make_space(uint64_t bytes, struct rhizo
   if (!sqlite_code_ok(stepcode))
     return RHIZOME_PAYLOAD_STATUS_ERROR;
 
-  rhizome_vacuum_db(&retry);
+  if ((r = sqlite_vacuum(&retry, &space)) != RHIZOME_PAYLOAD_STATUS_EMPTY)
+    return r;
 
-  if (db_used + bytes <= limit)
+  if (report)
+    report->space_used = space;
+
+  if (space.content_bytes + bytes <= space.content_limit_bytes)
     return RHIZOME_PAYLOAD_STATUS_NEW;
 
   DEBUGF(rhizome, "Not enough space for %"PRIu64". Used; %"PRIu64" = %"PRIu64" + %"PRIu64" * (%"PRIu64" - %"PRIu64"), Limit; %"PRIu64,
-	 bytes, db_used, external_bytes, db_page_size, db_page_count, db_free_page_count, limit);
+	 bytes, space.content_bytes, space.external_bytes, space.db_page_size, space.db_total_pages, space.db_available_pages, space.content_limit_bytes);
 
   return RHIZOME_PAYLOAD_STATUS_EVICTED;
 }

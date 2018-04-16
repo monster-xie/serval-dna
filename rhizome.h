@@ -367,16 +367,32 @@ sqlite_retry_state sqlite_retry_state_init(int serverLimit, int serverSleep, int
 
 #define SQLITE_RETRY_STATE_DEFAULT sqlite_retry_state_init(-1,-1,-1,-1)
 
+struct rhizome_space_report {
+  uint64_t external_bytes;
+
+  uint64_t db_page_size;
+  uint64_t db_total_pages;
+  uint64_t db_available_pages;
+
+  uint64_t content_bytes;
+  uint64_t content_limit_bytes;
+
+  uint64_t filesystem_bytes;
+  uint64_t filesystem_free_bytes;
+};
+
 struct rhizome_cleanup_report {
-    unsigned deleted_stale_incoming_files;
-    unsigned deleted_expired_files;
-    unsigned deleted_orphan_files;
-    unsigned deleted_orphan_fileblobs;
-    unsigned deleted_orphan_manifests;
+  struct rhizome_space_report space_used;
+  unsigned deleted_stale_incoming_files;
+  unsigned deleted_expired_files;
+  unsigned deleted_orphan_files;
+  unsigned deleted_orphan_fileblobs;
+  unsigned deleted_orphan_manifests;
 };
 
 int rhizome_cleanup(struct rhizome_cleanup_report *report);
 int rhizome_store_cleanup(struct rhizome_cleanup_report *report);
+enum rhizome_payload_status rhizome_store_space_usage(struct rhizome_space_report *space);
 void rhizome_vacuum_db(sqlite_retry_state *retry);
 int rhizome_manifest_createid(rhizome_manifest *m);
 struct rhizome_bundle_result rhizome_private_bundle(rhizome_manifest *m, const sign_keypair_t *keypair);
@@ -909,8 +925,6 @@ ssize_t rhizome_read_cached(const rhizome_bid_t *bid, uint64_t version, time_ms_
 int rhizome_cache_close();
 
 int rhizome_database_filehash_from_id(const rhizome_bid_t *bidp, uint64_t version, rhizome_filehash_t *hashp);
-
-void rhizome_sync_status();
 
 DECLARE_ALARM(rhizome_fetch_status);
 
